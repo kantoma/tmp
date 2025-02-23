@@ -6,123 +6,175 @@ from scipy.optimize import minimize_scalar
 
 class DirichletModel:
     """
-    DirichletモデルとNBDモデルのパラメータ推定および指標算出を行うクラス。
-    
-    【概要】
-    - NBD(Negative Binomial Distribution) を用いてカテゴリ全体の購買頻度分布を表現
-    - Dirichletモデルを用いて各ブランドへの購買割り振り（ペネトレーションや購入率）を説明
-    - K (NBDのパラメータ) と S (Dirichletのパラメータ) をデータから推定
-    - 推定されたパラメータをもとに、ブランド別の理論値(ペネトレーション、購入率など)を計算
+    NBD-Dirichletモデルに関するパラメータ(K, S)の推定と、ブランド別指標の計算を担うクラス。
+
+    【主な役割】
+      1) K, S を入力データから推定（通常のコンストラクタ __init__ ）
+      2) すでに K, S, M が判明している場合、推定をスキップしてインスタンスを生成（from_parameters）
+      3) ブランド別ペネトレーション, 理論的購入回数, カテゴリ平均購入回数などを計算
     """
 
     def __init__(
         self,
-        cat_pen,         # カテゴリ全体のペネトレーション（例えば、人口に対するそのカテゴリ購入者の割合）
-        cat_buyrate,     # カテゴリバイヤーの平均購入回数（期間内での平均購入頻度）
-        brand_share,     # 各ブランドの市場シェア（ブランド同士の比率; 合計1.0程度）
-        brand_pen_obs,   # 観測されたブランドペネトレーション（実測データ）
-        brand_name=None, # ブランド名のリスト（省略時は自動生成）
-        cat_pur_var=None,# カテゴリ購入率の分散を既知として与える場合に使用（省略可）
-        nstar=50,        # NBD分布を打ち切る上限値（カテゴリ購入回数を0～nstarまで考える）
-        max_S=30,        # Sを探す際の最大探索値
-        max_K=30,        # Kを探す際の最大探索値
-        check=False      # デバッグメッセージを表示するかどうか
+        cat_pen,          # カテゴリ全体のペネトレーション (例: カテゴリ購入者数 / 全体母数)
+        cat_buyrate,      # カテゴリバイヤー1人あたりの平均購入回数
+        brand_share,      # 各ブランドの市場シェア (合計1.0 程度が望ましい)
+        brand_pen_obs,    # 観測されたブランド別ペネトレーション (推定後の比較などに用いる)
+        brand_name=None,  # ブランド名のリスト (省略時は B1, B2,...)
+        cat_pur_var=None, # カテゴリ購入率の「分散」が既知の場合に指定 (K推定を省略するため)
+        nstar=50,         # NBD分布を計算する際の購入回数の上限 (0..nstar)
+        max_S=30,         # Sパラメータを探索する際の最大値
+        max_K=30,         # Kパラメータを探索する際の最大値
+        check=False,      # 推定過程のデバッグログを表示するかどうか
+        skip_estimation=False  # TrueにするとK, Sの推定を行わない (from_parameters で利用)
     ):
         """
-        コンストラクタ：
-        - 引数としてカテゴリペネトレーションやブランドシェア等を受け取り、
-          内部でNBD-Dirichletモデルのパラメータ(K, S)を推定する。
-        - 推定に使用するヘルパー関数（_estimate_K, _estimate_Sなど）を呼び出して初期化する。
+        通常のコンストラクタ:
+          - cat_pen, cat_buyrate などから K, S を推定 (skip_estimation=Falseの場合)
+          - skip_estimation=True なら推定ルーチンをスキップ (ユーザが後からK, Sを手動セット)
         """
-        self.cat_pen = cat_pen
-        self.cat_buyrate = cat_buyrate
-        self.brand_share = brand_share
-        self.brand_pen_obs = brand_pen_obs
-        self.nstar = nstar
-        self.max_S = max_S
-        self.max_K = max_K
-        self.check = check
+
+        # 入力パラメータをインスタンス変数に格納
+        self.cat_pen = cat_pen         # カテゴリペネトレーション
+        self.cat_buyrate = cat_buyrate # カテゴリバイヤー平均購入回数
+        self.brand_share = brand_share # ブランドシェア
+        self.brand_pen_obs = brand_pen_obs # 観測されたブランドペネトレーション
+        self.nstar = nstar            # NBDを0~nstarまで計算
+        self.max_S = max_S            # Sパラメータ最大探索値
+        self.max_K = max_K            # Kパラメータ最大探索値
+        self.check = check            # デバッグログを出すかどうか
 
         # ブランド数
         self.nbrand = len(brand_pen_obs)
 
-        # ブランド名が指定されていない場合は "B1", "B2", ... の形式で自動生成
+        # ブランド名が与えられなければ B1..Bn の連番とする
         if brand_name is None:
             self.brand_name = [f"B{i+1}" for i in range(self.nbrand)]
         else:
             self.brand_name = brand_name
 
-        # 基準期間(Period=1) での平均購入回数 M0 = カテゴリペネトレーション * 平均購入回数
+        # 基準期間(Period=1)での平均購入回数 = cat_pen * cat_buyrate
         self.M0 = self.cat_pen * self.cat_buyrate
-        # 現在の M は、分析期間を変更する際に更新されるが、初期値は M0
+        # 現在の M (解析対象期間の平均購入回数)。初期は M0 と同じ
         self.M = self.M0
 
-        # 1) Kパラメータ推定
-        self.K = self._estimate_K(cat_pur_var)
-        # 2) Sパラメータ推定
-        self.S = self._estimate_S()
+        # 識別用にクラス名を記録 (任意)
+        self.class_name = "dirichlet"
+        self.error = 0  # nstar のカバレッジチェックで使用
 
-        # nstar が十分に大きいかチェック（分布の合計が1に近いか、平均が妥当か）
+        if skip_estimation:
+            # 推定をスキップする場合はK,Sはユーザが後からセットする想定なのでダミーを入れる
+            self.K = None
+            self.S = None
+        else:
+            # 通常: K と S の推定を実施
+            self.K = self._estimate_K(cat_pur_var)
+            self.S = self._estimate_S()
+            # nstarが十分大きいかどうかチェック
+            self._check_nstar_coverage()
+
+    @classmethod
+    def from_parameters(
+        cls,
+        S,          # 既知の Dirichletパラメータ S
+        K,          # 既知の NBDパラメータ K
+        M,          # カテゴリ全体の平均購入回数 (=cat_pen*cat_buyrateに相当)
+        brand_share,# ブランドシェア
+        brand_name=None,
+        nstar=50,
+        check=False
+    ):
+        """
+        すでに S, K, M, brand_share がわかっている場合に、
+        推定をスキップしてインスタンスを生成するためのクラスメソッド。
+
+        - cat_pen などの推定用パラメータは使わないため、ダミーを設定して __init__ を呼ぶ
+        - skip_estimation=True でK,S推定をブロックし、後からK,S,Mを上書き
+        """
+        # cat_pen=0.0 など適当なダミー値を入れておく
+        # brand_pen_obs も 0埋めする (実際には使用しない)
+        cat_pen_dummy = 0.0
+        cat_buyrate_dummy = M
+        brand_pen_obs_dummy = [0.0]*len(brand_share)
+
+        # skip_estimation=True で初期化
+        instance = cls(
+            cat_pen=cat_pen_dummy,
+            cat_buyrate=cat_buyrate_dummy,
+            brand_share=brand_share,
+            brand_pen_obs=brand_pen_obs_dummy,
+            brand_name=brand_name,
+            cat_pur_var=None,
+            nstar=nstar,
+            max_S=30,
+            max_K=30,
+            check=check,
+            skip_estimation=True
+        )
+        # 推定をスキップした代わりに、ユーザ指定の S,K,M をそのままセット
+        instance.S = S
+        instance.K = K
+        instance.M0 = M  # 基準期間の平均購入回数 (M0)
+        instance.M = M   # 現在のM も M に合わせる
+
+        return instance
+
+    def _check_nstar_coverage(self):
+        """
+        nstar がカテゴリ分布(NBD)を十分にカバーできているか簡易チェックする。
+        - 0..nstar までの合計が99%未満なら分布が切れている恐れあり
+        - 分布の平均が self.M0 と大きくズレていたら要注意
+        """
         prob_sum = sum(self._Pn(i) for i in range(self.nstar+1))
         mean_cat = sum(i * self._Pn(i) for i in range(self.nstar+1))
         if prob_sum < 0.99 or abs(mean_cat - self.M0) > 0.1:
-            # 0.99 未満になるようなら、nstarが小さすぎて分布が取りきれていないかもしれない
             if self.check:
-                print(f"[Warning] nstar={nstar} が分布を十分にカバーしていない可能性があります。")
+                print(f"[Warning] nstar={self.nstar} が分布を十分にカバーしていない可能性があります。")
             self.error = 1
-        else:
-            self.error = 0
-
-        self.class_name = "dirichlet"
 
     def _estimate_K(self, cat_pur_var=None):
         """
-        Kパラメータを推定する内部メソッド。
-        
-        cat_pur_varが None の場合:
-          -> カテゴリペネトレーション（ゼロ購買）や平均購入回数をもとに最適化してKを求める
-        cat_pur_varが指定されている場合:
-          -> K = M^2 / (cat_pur_var - M) で直接計算（理論的な式に基づく）
+        NBDパラメータ K を推定する内部メソッド。
+        - cat_pur_var=None の場合 -> (ゼロ購買ロジック + 平均購入回数)から最適化
+        - cat_pur_var を与える -> 分散式から K を計算
         """
         if cat_pur_var is None:
-            # cat_pen から導出される式を用いて K を最適化
+            # cat_pen からログを計算
             cp = math.log(1 - self.cat_pen)
             def eq1(k):
-                # (k * log(1 + M/k) + log(1 - cat_pen))^2 を最小化する
+                # (k * log(1 + M/k) + log(1 - cat_pen))^2 を最小化
                 return (k * math.log(1 + self.M / k) + cp) ** 2
-            # scipy.optimize の minimize_scalar で最適化
+            # 範囲 (0.0001, max_K) で探索
             res = minimize_scalar(eq1, bounds=(0.0001, self.max_K), method='bounded')
             return res.x
         else:
-            # 分散を用いる式
+            # cat_pur_var が与えられたら M^2 / (cat_pur_var - M) の公式で直接計算
             return (self.M**2) / (cat_pur_var - self.M)
 
     def _estimate_S(self):
         """
-        Sパラメータを推定する内部メソッド。
-        
-        1) 各ブランドごとに最適なSを個別に探し
-        2) 外れ値を削除
-        3) シェア加重平均を取って最終的なSとする
+        Dirichletパラメータ S を推定する内部メソッド。
+        各ブランドについて理論ペネトレーションと観測値の誤差最小化 -> 外れ値除外 -> シェア加重平均
         """
         if self.check:
-            print("[Info] 各ブランドのSを推定中...")
+            print("[Info] 各ブランドに対してSを推定中...")
 
         def find_opt_S_for_brand(j):
-            # ブランド j に対して、理論ペネトレーションと観測値の二乗誤差が最小になるSを探す
+            # ブランド j に対する最適Sを bounded検索
             res = minimize_scalar(self._eq2, bounds=(0, self.max_S), method='bounded', args=(j,))
             if self.check:
-                print(f"[Debug] Brand {j+1}, S={res.x:.4f}, Objective={res.fun:.6f}")
+                print(f"[Debug] Brand {j+1}: S={res.x:.4f}, Objective={res.fun:.6f}")
             return res.x
 
-        # ブランド毎に S を計算
+        # 各ブランドごとに S を探索
         S_list = [find_opt_S_for_brand(j) for j in range(self.nbrand)]
+        # 箱ひげ図から外れ値を判定
         bp = self._boxplot_stats(S_list)
-        outlier = bp["out"]    # 箱ひげ図上の外れ値
-        outlier2 = [s for s in S_list if s > bp["conf"][1]]  # ノッチ上限を越えるもの
+        outlier = bp["out"]
+        outlier2 = [s for s in S_list if s > bp["conf"][1]]
         outliers = outlier + outlier2
 
-        # 外れ値ではないものだけ残す
+        # 外れ値を除いたものだけでシェア加重平均
         schoose = [(s not in outliers) for s in S_list]
         if self.check and len(outliers) > 0:
             idx_out_brands = [i+1 for i, sc in enumerate(schoose) if not sc]
@@ -130,25 +182,16 @@ class DirichletModel:
 
         chosen_S = [S_list[i] for i, sc in enumerate(schoose) if sc]
         chosen_w = [self.brand_share[i] for i, sc in enumerate(schoose) if sc]
-
-        # 全部外れ値になってしまった場合は fallback で平均値を使用
         if sum(chosen_w) == 0:
+            # 全部外れ値になった場合は 平均値で代替
             S_final = np.mean(S_list)
         else:
-            # シェア(brand_share)で加重平均
             S_final = np.average(chosen_S, weights=chosen_w)
-
         return S_final
 
     def _boxplot_stats(self, data):
         """
-        箱ひげ図で用いられる外れ値検出・ノッチ範囲を計算する内部メソッド。
-        
-        返す値は以下のような辞書:
-        {
-          "out": 外れ値のリスト,
-          "conf": [ノッチの下限, ノッチの上限]
-        }
+        箱ひげ図で使われる外れ値判定およびノッチ(conf区間)を計算する内部メソッド
         """
         arr = np.array(data)
         q1 = np.percentile(arr, 25)
@@ -157,9 +200,12 @@ class DirichletModel:
         median = np.median(arr)
         n = len(arr)
 
+        # 1.5IQRを超えるものを外れ値とする
         lower_whisker = q1 - 1.5 * iqr
         upper_whisker = q3 + 1.5 * iqr
         outliers = arr[(arr < lower_whisker) | (arr > upper_whisker)]
+
+        # ノッチは median ± 1.58 * IQR / sqrt(n)
         conf_lower = median - 1.58 * iqr / math.sqrt(n)
         conf_upper = median + 1.58 * iqr / math.sqrt(n)
 
@@ -170,8 +216,7 @@ class DirichletModel:
 
     def _eq2(self, S, j):
         """
-        理論ペネトレーション(カテゴリ*NBD×Dirichlet) と
-        観測ペネトレーション(brand_pen_obs) の二乗誤差を返す。
+        ブランドjの理論ペネトレーションと観測ペネトレーションの二乗誤差
         """
         t_pen = 1.0 - sum(self._Pn(i) * self._pzeron(i, j, S) for i in range(self.nstar+1))
         o_pen = self.brand_pen_obs[j]
@@ -179,26 +224,26 @@ class DirichletModel:
 
     def _pzeron(self, n, j, S):
         """
-        n回カテゴリを買うバイヤーが、ブランドjを0回も買わない確率。
+        n回カテゴリを購入した人が、ブランドjを1回も買わない確率
         """
         alpha_j = S * self.brand_share[j]
         if n == 0:
             return 1.0
-        return math.exp(sum(math.log(S - alpha_j + i) - math.log(S + i) for i in range(n)))
+        return math.exp(sum(
+            math.log(S - alpha_j + i) - math.log(S + i)
+            for i in range(n)
+        ))
 
     def _p_rj_n(self, rj, n, j, S):
         """
-        n回カテゴリを買うバイヤーが、ブランドjをrj回購入する確率。
+        n回カテゴリを購入した人が、ブランドjをrj回買う確率
         """
         alpha_j = S * self.brand_share[j]
         return comb(n, rj) * beta(alpha_j + rj, (S - alpha_j) + (n - rj)) / beta(alpha_j, (S - alpha_j))
 
     def _Pn(self, n):
         """
-        NBD分布による、カテゴリをn回購入する確率。
-        
-        K, M に基づき:
-        p(n) = 定数 * (K+...)/(1+...) の積の形で表される。
+        カテゴリ全体のNBD分布 (カテゴリをn回買う確率) を計算
         """
         if n == 0:
             g = 0.0
@@ -212,43 +257,49 @@ class DirichletModel:
 
     def period_set(self, t):
         """
-        解析対象期間を t倍に変更し、それに合わせて平均購買回数 M を更新する。
-        （時間が2倍になれば M も2倍になる想定）
+        解析対象期間を t倍に伸ばす (M0を t倍にするイメージ)
         """
         self.M = self.M0 * t
 
     def period_print(self):
         """
-        現在の期間が基準期間(M0)の何倍になっているかを表示。
+        現在の M が基準M0 の何倍かを表示
         """
         ratio = self.M / self.M0
         print(f"期間倍率: {round(ratio,2)}, 現在のM = {self.M}")
 
     def brand_pen(self, j):
         """
-        現在パラメータ(M, S)下でのブランドjの理論ペネトレーションを計算。
+        ブランドjの理論的ペネトレーションを計算
         """
-        p0 = sum(self._Pn(i) * self._p_rj_n(0, i, j, self.S) for i in range(self.nstar+1))
+        p0 = sum(
+            self._Pn(i) * self._p_rj_n(0, i, j, self.S)
+            for i in range(self.nstar+1)
+        )
         return 1.0 - p0
 
     def brand_buyrate(self, j):
         """
-        ブランドjバイヤー1人あたりの理論的購入回数を計算。
+        ブランドjバイヤー1人あたりの理論購入回数
         """
         denom = self.brand_pen(j)
         if denom == 0:
             return 0.0
 
         def buyrate_n(n):
-            return sum(r * self._p_rj_n(r, n, j, self.S) for r in range(1, n+1))
-
-        numerator = sum(self._Pn(n) * buyrate_n(n) for n in range(1, self.nstar+1))
+            return sum(
+                r * self._p_rj_n(r, n, j, self.S)
+                for r in range(1, n+1)
+            )
+        numerator = sum(
+            self._Pn(n) * buyrate_n(n)
+            for n in range(1, self.nstar+1)
+        )
         return numerator / denom
 
     def wp(self, j):
         """
-        ブランドj購入者のカテゴリ平均購入回数を計算。
-        ( = n回中、ブランドjを買っている人が、そのn回全体で何回買っているかの平均)
+        ブランドjの購入者がカテゴリを合計何回買っているかの平均
         """
         denom = self.brand_pen(j)
         if denom == 0:
@@ -260,18 +311,17 @@ class DirichletModel:
 
     def get_brand_metrics(self):
         """
-        ブランド別に:
-          - 実測ペネトレーション(Pen_Observed)
+        ブランド別の指標をまとめ、pandas.DataFrame で返す
+          - 観測ペネトレーション(Pen_Observed)
           - 理論ペネトレーション(Pen_Theoretical)
-          - その差分(Pen_Diff)
-          - 理論購入回数(BuyRate_Theoretical)
+          - その差(Pen_Diff)
+          - 理論的購入回数(BuyRate_Theoretical)
           - カテゴリ平均購入回数(WP_Theoretical)
-        をまとめて DataFrame で返す。
         """
         records = []
         for j in range(self.nbrand):
-            obs_pen = self.brand_pen_obs[j]  # 観測されたブランドペネトレーション
-            thr_pen = self.brand_pen(j)      # 理論ペネトレーション
+            obs_pen = self.brand_pen_obs[j]
+            thr_pen = self.brand_pen(j)
             diff_pen = thr_pen - obs_pen
             thr_buy = self.brand_buyrate(j)
             thr_wp = self.wp(j)
@@ -288,7 +338,7 @@ class DirichletModel:
 
     def get_parameters_summary(self):
         """
-        推定された S, K や、基準期間の M0、現在の M, cat_pen, cat_buyrate などをまとめた DataFrameを返す。
+        現時点の推定/設定パラメータをDataFrameにして返す (S, K, Mなど)
         """
         data = {
             "S": [self.S],
@@ -303,15 +353,13 @@ class DirichletModel:
 
 class DirichletSummary:
     """
-    DirichletModel から集計レポートを作成するクラス。
-    
-    Rの summary.dirichlet が提供する "buy", "freq", "heavy", "dup" のようなレポートを、
-    Python で再現する責務を担う。
+    DirichletModel オブジェクトから各種サマリー (buy, freq, heavy, dup) を作成するクラス。
+    Rの summary.dirichlet 相当。
     """
 
-    def __init__(self, model):
+    def __init__(self, model: DirichletModel):
         """
-        DirichletModel のインスタンスを受け取り、サマリー出力に利用する。
+        model : DirichletModel のインスタンス
         """
         self.model = model
 
@@ -325,37 +373,21 @@ class DirichletSummary:
         dup_brand=1
     ):
         """
-        Rのsummary.dirichletに相当する集計を実行し、結果を辞書で返す。
-        
-        Parameters
-        ----------
-        t : float
-            期間の倍率(例: 2.0なら2倍の期間)。model.period_set(t) を呼び出してから集計する。
-        type : tuple(str)
-            "buy","freq","heavy","dup" の中から出力したい集計を指定。
-        digits : int
-            小数点以下を何桁で四捨五入するか。
-        freq_cutoff : int
-            購入回数分布（freqサマリー）で、ここを超えると "freq_cutoff+1+" にまとめる。
-        heavy_limit : iterable
-            heavyサマリーで「ヘビーバイヤー」とみなすカテゴリ購入回数の範囲。（デフォルト 1..6）
-        dup_brand : int
-            dupサマリーで重複購買(duplication)を分析するブランドを1-basedインデックスで指定。
-        
-        Returns
-        -------
-        result : dict
-            キーが "buy","freq","heavy","dup" のいずれかになり、
-            値がサマリー結果（DataFrame or Series）となる辞書を返す。
+        指定した種類のサマリーをまとめて計算し、dict形式で返す。
+        t : 集計期間倍率。model.period_set(t) によって M をスケールさせる
+        type : ("buy", "freq", "heavy", "dup") などを指定 (複数可)
+        digits : 小数点以下の丸め桁数
+        freq_cutoff : freqサマリーでの上限（freq_cutoff+1回以上をまとめる）
+        heavy_limit : heavyサマリーで「ヘビーバイヤー」とみなすカテゴリ購入回数 (デフォルト range(1,7))
+        dup_brand : dupサマリーで重複購買を解析する際の注目ブランド(1-basedインデックス)
         """
-        # 期間をt倍に変更
+        # 期間を t倍にして集計
         self.model.period_set(t)
 
         result = {}
         if heavy_limit is None:
             heavy_limit = range(1,7)
 
-        # ローカル関数: heavyサマリーなどで部分的に使用
         def _brand_pen_with_limit(j, limit):
             p0 = 0.0
             for n in limit:
@@ -380,7 +412,7 @@ class DirichletSummary:
 
         for tt in type:
             if tt == "buy":
-                # "buy"サマリー: ブランドごとの理論ペネトレーション(pen.brand), 理論購入回数(pur.brand), カテゴリ平均購入(pur.cat)を返す
+                # ブランドごとのペネトレーション(pen.brand)、購入率(pur.brand)、カテゴリ平均(pur.cat)を計算
                 pen_brand = [self.model.brand_pen(j) for j in brand_idxs]
                 pur_brand = [self.model.brand_buyrate(j) for j in brand_idxs]
                 pur_cat   = [self.model.wp(j) for j in brand_idxs]
@@ -392,7 +424,7 @@ class DirichletSummary:
                 result["buy"] = df_buy
 
             elif tt == "freq":
-                # "freq"サマリー: 0回,1回,...,freq_cutoff回, freq_cutoff+1回以上 の購入回数分布をブランド別に返す
+                # 各ブランドの購入回数分布を 0..freq_cutoff, freq_cutoff+1+ でまとめる
                 def prob_r(r, j):
                     s = 0.0
                     for n in range(r, self.model.nstar+1):
@@ -401,10 +433,8 @@ class DirichletSummary:
 
                 arr = np.zeros((nbrand, freq_cutoff+2))
                 for j in brand_idxs:
-                    # 0..freq_cutoff 回
                     for r_ in range(freq_cutoff+1):
                         arr[j, r_] = prob_r(r_, j)
-                    # freq_cutoff+1 回以上
                     tail_sum = 0.0
                     for n in range(freq_cutoff+1, self.model.nstar+1):
                         tail_sum += prob_r(n, j)
@@ -415,8 +445,8 @@ class DirichletSummary:
                 result["freq"] = df_freq
 
             elif tt == "heavy":
-                # "heavy"サマリー: heavy_limitで指定したカテゴリ購入回数のバイヤーに限定したときの
-                # ブランドペネトレーション & 購入頻度を計算
+                # heavy_limit の範囲(例:1..6)内のカテゴリ購入者に限ったとき、
+                # ブランドのペネトレーションと購入頻度を求める
                 Pn_sum = sum(self.model._Pn(n) for n in heavy_limit)
                 mat = np.zeros((nbrand, 2))
                 for j in brand_idxs:
@@ -431,9 +461,7 @@ class DirichletSummary:
                     if denom == 0:
                         avg_freq = 0.0
                     else:
-                        # ブランドjのバイヤーがheavyセグメント内で何回買っているか？
                         avg_freq = buyrate_hlimit * brand_pen_full / denom
-
                     mat[j, 0] = pen_heavy
                     mat[j, 1] = avg_freq
 
@@ -445,9 +473,8 @@ class DirichletSummary:
                 result["heavy"] = df_heavy
 
             elif tt == "dup":
-                # "dup"サマリー: duplication(重複購買)解析
-                # dup_brand で指定したブランドを focal brand として、
-                # そのブランド購買者が他のブランドをどの程度併買しているかを計算
+                # dup_brand で指定したブランド(1-based)をフォーカルブランドとして、
+                # そのブランド購買者が他ブランドをどの程度重複購入しているか
                 k_idx = dup_brand - 1
                 r_dup = np.zeros(nbrand)
                 r_dup[k_idx] = 1.0
@@ -457,7 +484,7 @@ class DirichletSummary:
                 for j in other_idx:
                     p0 = 0.0
                     for n in range(self.model.nstar+1):
-                        alpha_sum = self.model.S * (self.model.brand_share[k_idx] + self.model.brand_share[j])
+                        alpha_sum = self.model.S*(self.model.brand_share[k_idx] + self.model.brand_share[j])
                         num = beta(alpha_sum, (self.model.S - alpha_sum) + n)
                         den = beta(alpha_sum, (self.model.S - alpha_sum))
                         p_comp_0 = num / den
@@ -475,22 +502,19 @@ class DirichletSummary:
                 s_dup = pd.Series(r_dup, index=self.model.brand_name).round(digits)
                 result["dup"] = s_dup
 
-            else:
-                # 不明なタイプはスキップ
-                continue
-
         return result
 
 
-# 実行例 (このファイルを単独で実行した場合にのみ動作)
+# このファイルを直接実行した場合に、下記のデモコードが動作する
 if __name__ == "__main__":
+    # 【デモ１】: cat_penなどから自動推定するパターン
     cat_pen_example = 0.6
     cat_buyrate_example = 2.0
     brand_share_example = [0.3, 0.2, 0.5]
     brand_pen_obs_example = [0.15, 0.10, 0.35]
     brand_name_example = ["BrandA", "BrandB", "BrandC"]
 
-    # DirichletModelを作成
+    # 推定モードでモデルを作成
     model = DirichletModel(
         cat_pen=cat_pen_example,
         cat_buyrate=cat_buyrate_example,
@@ -500,9 +524,8 @@ if __name__ == "__main__":
         check=True
     )
 
-    # サマリー用クラスを作成し、集計を行う
+    # サマリー作成クラスを用いて集計
     reporter = DirichletSummary(model)
-
     summaries = reporter.summary_dirichlet(
         t=1,
         type=("buy","freq","heavy","dup"),
@@ -511,25 +534,30 @@ if __name__ == "__main__":
         heavy_limit=range(1,7),
         dup_brand=1
     )
-
-    print("=== Summary: buy ===")
+    print("=== Summary buy ===")
     print(summaries["buy"], "\n")
 
-    print("=== Summary: freq ===")
-    print(summaries["freq"], "\n")
-
-    print("=== Summary: heavy ===")
-    print(summaries["heavy"], "\n")
-
-    print("=== Summary: dup ===")
-    print(summaries["dup"], "\n")
-
-    # ブランド別メトリクス
-    df_metrics = model.get_brand_metrics()
-    print("=== get_brand_metrics() from DirichletModel ===")
-    print(df_metrics, "\n")
-
-    # 推定パラメータの一覧
     df_params = model.get_parameters_summary()
-    print("=== get_parameters_summary() ===")
+    print("=== Estimated Params ===")
     print(df_params, "\n")
+
+    # 【デモ２】: S,K,M がすでにわかっている場合 (推定をスキップ)
+    S_known = 5.0
+    K_known = 3.0
+    M_known = 1.2
+    brand_share_known = [0.25, 0.19, 0.1, 0.1, 0.09, 0.08, 0.03, 0.02]
+
+    model_known = DirichletModel.from_parameters(
+        S=S_known,
+        K=K_known,
+        M=M_known,
+        brand_share=brand_share_known,
+        nstar=50,
+        check=False
+    )
+    print("=== from_parameters: no estimation ===")
+    print(model_known.get_parameters_summary(), "\n")
+
+    # 簡単な確認: Brand0 (インデックス0) の理論ペネトレーション
+    pen_b0 = model_known.brand_pen(0)
+    print(f"Brand0 Pen (theoretical): {pen_b0}")
